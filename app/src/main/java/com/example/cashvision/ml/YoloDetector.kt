@@ -10,6 +10,11 @@ import kotlinx.coroutines.withContext
 import java.nio.FloatBuffer
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.exp
+
+private fun sigmoid(x: Float): Float {
+    return 1.0f / (1.0f + exp(-x))
+}
 
 class YoloDetector(private val context: Context) {
     
@@ -18,16 +23,15 @@ class YoloDetector(private val context: Context) {
     
     // Model configuration
     private val inputSize = 640
-    private val confidenceThreshold = 0.3f  // Reducido para detectar billetes reales
-    private val iouThreshold = 0.4f  // Ajustado para mejor NMS
+    private val confidenceThreshold = 0.6f  // Aumentado para reducir falsos positivos
+    private val iouThreshold = 0.45f  // Se mantiene igual
     
     // Class names - adjust according to your model (solo 5 clases)
     private val classNames = arrayOf(
         "billete_1000",
         "billete_2000",
         "billete_5000",
-        "billete_10000",
-        "billete_20000"
+        "billete_10000" // Ajustado a 4 clases según la salida del modelo [1, 9, 8400]
     )
     
     companion object {
@@ -85,46 +89,18 @@ class YoloDetector(private val context: Context) {
                 Log.d(TAG, "Output $i type: ${output.value::class.java.simpleName}")
             }
             
-            // Process outputs - Primero vamos a inspeccionar la estructura
+            // Process outputs - El log indica que el formato es float[][][]
+            // Esto significa que outputs[0].value es Array<Array<FloatArray>>
+            // Y la forma es [1, 9, 8400]
+            // Donde outputValue[0] es un Array<FloatArray> de tamaño 9
+            // Y cada FloatArray tiene 8400 elementos (para x, y, w, h, obj, class0, ..., class4)
             val outputValue = outputs[0].value
-            Log.d(TAG, "Output type: ${outputValue::class.java.simpleName}")
-
-            // Intentar diferentes formatos de salida
-            val detections = when (outputValue) {
-                is Array<*> -> {
-                    Log.d(TAG, "Output is Array, size: ${outputValue.size}")
-                    if (outputValue.isNotEmpty()) {
-                        val firstElement = outputValue[0]
-                        Log.d(TAG, "First element type: ${firstElement?.javaClass?.simpleName ?: "null"}")
-                        when (firstElement) {
-                            is Array<*> -> {
-                                Log.d(TAG, "Nested array, size: ${firstElement.size}")
-                                if (firstElement.isNotEmpty()) {
-                                    Log.d(TAG, "Second level type: ${firstElement[0]?.javaClass?.simpleName ?: "null"}")
-                                }
-                                postprocessOutput(outputValue as Array<Array<FloatArray>>, bitmap.width, bitmap.height)
-                            }
-                            is FloatArray -> {
-                                Log.d(TAG, "FloatArray, size: ${firstElement.size}")
-                                postprocessOutputFlat(outputValue as Array<FloatArray>, bitmap.width, bitmap.height)
-                            }
-                            else -> {
-                                Log.e(TAG, "Unexpected output format")
-                                emptyList()
-                            }
-                        }
-                    } else {
-                        emptyList()
-                    }
-                }
-                is FloatArray -> {
-                    Log.d(TAG, "Output is FloatArray, size: ${outputValue.size}")
-                    postprocessOutputSingle(outputValue, bitmap.width, bitmap.height)
-                }
-                else -> {
-                    Log.e(TAG, "Unknown output format: ${outputValue::class.java.simpleName}")
-                    emptyList()
-                }
+            val detections = if (outputValue is Array<*>) {
+                val outputArray = outputValue as Array<Array<FloatArray>>
+                postprocessOutput(outputArray, bitmap.width, bitmap.height)
+            } else {
+                Log.e(TAG, "Unexpected output format: ${outputValue::class.java.simpleName}. Expected Array<Array<FloatArray>>.")
+                emptyList()
             }
             
             // Clean up
@@ -152,11 +128,11 @@ class YoloDetector(private val context: Context) {
         resizedBitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
 
         // Convert to CHW format (channels first) y normalizar correctamente
-        // Orden: R channel completo, luego G channel completo, luego B channel completo
+        // Orden: B channel completo, luego G channel completo, luego R channel completo (común en modelos YOLO)
         for (i in pixels.indices) {
             val pixel = pixels[i]
-            val r = ((pixel shr 16) and 0xFF) / 255.0f
-            buffer.put(r)
+            val b = (pixel and 0xFF) / 255.0f
+            buffer.put(b)
         }
 
         for (i in pixels.indices) {
@@ -167,8 +143,8 @@ class YoloDetector(private val context: Context) {
 
         for (i in pixels.indices) {
             val pixel = pixels[i]
-            val b = (pixel and 0xFF) / 255.0f
-            buffer.put(b)
+            val r = ((pixel shr 16) and 0xFF) / 255.0f
+            buffer.put(r)
         }
 
         buffer.rewind()
@@ -181,117 +157,103 @@ class YoloDetector(private val context: Context) {
      * Resize bitmap - SIMPLIFICADO para evitar problemas de coordenadas
      */
     private fun resizeBitmapWithPadding(bitmap: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
-        // Por ahora, usar resize simple sin padding para evitar problemas de coordenadas
-        Log.d(TAG, "Resizing bitmap from ${bitmap.width}x${bitmap.height} to ${targetWidth}x${targetHeight}")
-        return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+        val originalWidth = bitmap.width
+        val originalHeight = bitmap.height
+
+        val scale: Float
+        val xOffset: Float
+        val yOffset: Float
+
+        if (originalWidth > originalHeight) {
+            scale = targetWidth.toFloat() / originalWidth
+            xOffset = 0f
+            yOffset = (targetHeight - originalHeight * scale) / 2f
+        } else {
+            scale = targetHeight.toFloat() / originalHeight
+            yOffset = 0f
+            xOffset = (targetWidth - originalWidth * scale) / 2f
+        }
+
+        val matrix = android.graphics.Matrix()
+        matrix.postScale(scale, scale)
+        matrix.postTranslate(xOffset, yOffset)
+
+        val paddedBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(paddedBitmap)
+        canvas.drawBitmap(bitmap, matrix, null)
+
+        Log.d(TAG, "Resized bitmap from ${originalWidth}x${originalHeight} to ${targetWidth}x${targetHeight} with padding. Scale: $scale, Offset: ($xOffset, $yOffset)")
+        return paddedBitmap
     }
     
     /**
-     * Post-process YOLO output - formato original
+     * Post-process YOLO output para formato [1, 9, 8400]
      */
     private fun postprocessOutput(
-        output: Array<Array<FloatArray>>,
+        output: Array<Array<FloatArray>>, // Ahora es Array<Array<FloatArray>>
         originalWidth: Int,
         originalHeight: Int
     ): List<Detection> {
         val detections = mutableListOf<Detection>()
 
-        Log.d(TAG, "Processing nested array output")
-        Log.d(TAG, "Output dimensions: ${output.size} x ${output[0].size}")
-        if (output[0].isNotEmpty()) {
-            Log.d(TAG, "Detection array size: ${output[0][0].size}")
-        }
+        Log.d(TAG, "Processing transposed output format")
+        // output[0] es el array de 9 FloatArrays, cada uno con 8400 elementos
+        val numDetections = output[0][0].size // 8400 detecciones
+        val elementsPerDetection = output[0].size // 9 elementos por detección (x,y,w,h,obj,class_scores)
 
-        // Process each detection
-        for (detection in output[0]) {
-            if (detection.size < 5 + classNames.size) {
-                Log.d(TAG, "Skipping detection with insufficient data: ${detection.size}")
-                continue
-            }
+        Log.d(TAG, "Output dimensions: ${elementsPerDetection} x ${numDetections}")
 
-            val centerX = detection[0]
-            val centerY = detection[1]
-            val width = detection[2]
-            val height = detection[3]
-            val objectness = detection[4]
+        for (i in 0 until numDetections) {
+            val centerX = output[0][0][i]
+            val centerY = output[0][1][i]
+            val width = output[0][2][i]
+            val height = output[0][3][i]
+            val objectnessRaw = output[0][4][i] // Raw objectness score
 
-            Log.d(TAG, "Raw detection: centerX=$centerX, centerY=$centerY, width=$width, height=$height, objectness=$objectness")
+            // Aplicar sigmoide a objectness
+            val objectness = sigmoid(objectnessRaw)
+
+            // Log.d(TAG, "Raw detection $i: centerX=$centerX, centerY=$centerY, width=$width, height=$height, objectnessRaw=$objectnessRaw, objectness=$objectness")
 
             if (objectness < confidenceThreshold) {
-                Log.d(TAG, "Skipping detection with low objectness: $objectness")
+                // Log.d(TAG, "Skipping detection $i with low objectness: $objectness")
                 continue
             }
 
-            // Find best class
+            // Find best class and apply sigmoid to class scores
             var bestClassId = -1
             var bestClassScore = 0f
 
-            for (i in classNames.indices) {
-                val classScore = detection[5 + i]
-                if (classScore > bestClassScore) {
-                    bestClassScore = classScore
-                    bestClassId = i
+            for (j in classNames.indices) {
+                val classScoreRaw = output[0][5 + j][i] // Raw class score
+                val activatedClassScore = sigmoid(classScoreRaw)
+                if (activatedClassScore > bestClassScore) {
+                    bestClassScore = activatedClassScore
+                    bestClassId = j
                 }
             }
 
-            // Calcular confianza final y aplicar validaciones adicionales
-            val finalConfidence = if (bestClassScore > 1.0f) {
-                // Si los scores son > 1, probablemente están mal escalados
-                Log.d(TAG, "Unusual class score > 1.0: $bestClassScore, using objectness only")
-                objectness
-            } else {
-                objectness * bestClassScore
-            }
+            // Calcular confianza final: objectness * bestClassScore (ambos ya sigmoid)
+            val finalConfidence = objectness * bestClassScore
 
-            // Validaciones básicas para reducir falsos positivos
-            if (objectness < 0.1f) {
-                Log.d(TAG, "Rejecting detection with very low objectness: $objectness")
-                continue
-            }
+            // Validaciones básicas para reducir falsos positivos (se confía más en confidenceThreshold)
 
-            if (bestClassScore < 0.1f) {
-                Log.d(TAG, "Rejecting detection with very low class score: $bestClassScore")
-                continue
-            }
-
-            Log.d(TAG, "Best class: $bestClassId (${classNames.getOrNull(bestClassId)}), classScore=$bestClassScore, finalConfidence=$finalConfidence")
+            // Log.d(TAG, "Best class: $bestClassId (${classNames.getOrNull(bestClassId)}), classScore=$bestClassScore, finalConfidence=$finalConfidence")
 
             if (finalConfidence < confidenceThreshold || bestClassId == -1) {
-                Log.d(TAG, "Skipping detection with low final confidence: $finalConfidence")
+                // Log.d(TAG, "Skipping detection with low final confidence: $finalConfidence")
                 continue
             }
 
-            // Determinar si las coordenadas están normalizadas (0-1) o en píxeles
-            val isNormalized = centerX <= 1.0f && centerY <= 1.0f && width <= 1.0f && height <= 1.0f
+            // Coordenadas están normalizadas (0-1) con respecto al inputSize (640x640)
+            // Convertir a píxeles de la imagen original
+            val scaleX = originalWidth.toFloat() / inputSize
+            val scaleY = originalHeight.toFloat() / inputSize
 
-            Log.d(TAG, "Coordinate analysis: centerX=$centerX, centerY=$centerY, width=$width, height=$height")
-            Log.d(TAG, "Original image size: ${originalWidth}x${originalHeight}, Input size: ${inputSize}x${inputSize}")
-            Log.d(TAG, "Is normalized: $isNormalized")
-
-            val left: Float
-            val top: Float
-            val right: Float
-            val bottom: Float
-
-            if (isNormalized) {
-                // Coordenadas normalizadas - convertir a píxeles
-                Log.d(TAG, "Using normalized coordinates")
-                left = (centerX - width / 2) * originalWidth
-                top = (centerY - height / 2) * originalHeight
-                right = (centerX + width / 2) * originalWidth
-                bottom = (centerY + height / 2) * originalHeight
-            } else {
-                // Coordenadas ya en píxeles - escalar desde input size
-                Log.d(TAG, "Using pixel coordinates, scaling from input size")
-                val scaleX = originalWidth.toFloat() / inputSize
-                val scaleY = originalHeight.toFloat() / inputSize
-                left = (centerX - width / 2) * scaleX
-                top = (centerY - height / 2) * scaleY
-                right = (centerX + width / 2) * scaleX
-                bottom = (centerY + height / 2) * scaleY
-            }
-
-            Log.d(TAG, "Calculated bbox: left=$left, top=$top, right=$right, bottom=$bottom")
+            val left = (centerX - width / 2) * scaleX
+            val top = (centerY - height / 2) * scaleY
+            val right = (centerX + width / 2) * scaleX
+            val bottom = (centerY + height / 2) * scaleY
 
             val bbox = RectF(
                 max(0f, left),
@@ -304,7 +266,7 @@ class YoloDetector(private val context: Context) {
             val bboxWidth = bbox.width()
             val bboxHeight = bbox.height()
 
-            if (bboxWidth < 10f || bboxHeight < 10f) {
+            if (bboxWidth < 5f || bboxHeight < 5f) { // Reducir umbral de tamaño mínimo
                 Log.d(TAG, "Skipping detection with too small bbox: ${bboxWidth}x${bboxHeight}")
                 continue
             }
@@ -314,7 +276,7 @@ class YoloDetector(private val context: Context) {
             val bboxArea = bboxWidth * bboxHeight
             val areaRatio = bboxArea / imageArea
 
-            if (areaRatio > 0.95f) {
+            if (areaRatio > 0.99f) { // Aumentar umbral de área máxima
                 Log.d(TAG, "Skipping detection with too large bbox (${(areaRatio * 100).toInt()}% of image)")
                 continue
             }
@@ -338,184 +300,7 @@ class YoloDetector(private val context: Context) {
 
         return finalDetections
     }
-
-    /**
-     * Post-process YOLO output for flat array format
-     */
-    private fun postprocessOutputFlat(
-        output: Array<FloatArray>,
-        originalWidth: Int,
-        originalHeight: Int
-    ): List<Detection> {
-        val detections = mutableListOf<Detection>()
-
-        Log.d(TAG, "Processing flat output with ${output.size} arrays")
-
-        // Para formato YOLOv5/v8, cada detección es [x, y, w, h, conf, class_scores...]
-        for (i in output.indices) {
-            val detection = output[i]
-            if (detection.size < 5 + classNames.size) {
-                Log.d(TAG, "Skipping detection $i with insufficient data: ${detection.size}")
-                continue
-            }
-
-            val centerX = detection[0]
-            val centerY = detection[1]
-            val width = detection[2]
-            val height = detection[3]
-            val objectness = detection[4]
-
-            Log.d(TAG, "Detection $i: centerX=$centerX, centerY=$centerY, width=$width, height=$height, objectness=$objectness")
-
-            if (objectness < confidenceThreshold) {
-                Log.d(TAG, "Skipping detection $i with low objectness: $objectness")
-                continue
-            }
-
-            // Find best class
-            var bestClassId = -1
-            var bestClassScore = 0f
-
-            for (j in classNames.indices) {
-                val classScore = detection[5 + j]
-                if (classScore > bestClassScore) {
-                    bestClassScore = classScore
-                    bestClassId = j
-                }
-            }
-
-            val finalConfidence = objectness * bestClassScore
-
-            if (finalConfidence < confidenceThreshold || bestClassId == -1) {
-                Log.d(TAG, "Skipping detection $i with low final confidence: $finalConfidence")
-                continue
-            }
-
-            // Convert normalized coordinates to pixel coordinates
-            val scaleX = originalWidth.toFloat()
-            val scaleY = originalHeight.toFloat()
-
-            val left = (centerX - width / 2) * scaleX
-            val top = (centerY - height / 2) * scaleY
-            val right = (centerX + width / 2) * scaleX
-            val bottom = (centerY + height / 2) * scaleY
-
-            val bbox = RectF(
-                max(0f, left),
-                max(0f, top),
-                min(originalWidth.toFloat(), right),
-                min(originalHeight.toFloat(), bottom)
-            )
-
-            if (bbox.width() < 10f || bbox.height() < 10f) {
-                Log.d(TAG, "Skipping detection $i with too small bbox: ${bbox.width()}x${bbox.height()}")
-                continue
-            }
-
-            detections.add(
-                Detection(
-                    bbox = bbox,
-                    confidence = finalConfidence,
-                    classId = bestClassId,
-                    className = classNames[bestClassId]
-                )
-            )
-        }
-
-        Log.d(TAG, "Found ${detections.size} valid detections from flat format")
-        return applyNMS(detections)
-    }
-
-    /**
-     * Post-process YOLO output for single array format
-     */
-    private fun postprocessOutputSingle(
-        output: FloatArray,
-        originalWidth: Int,
-        originalHeight: Int
-    ): List<Detection> {
-        val detections = mutableListOf<Detection>()
-
-        Log.d(TAG, "Processing single array output with ${output.size} elements")
-
-        // Calcular cuántas detecciones hay
-        val elementsPerDetection = 5 + classNames.size
-        val numDetections = output.size / elementsPerDetection
-
-        Log.d(TAG, "Elements per detection: $elementsPerDetection, Number of detections: $numDetections")
-
-        for (i in 0 until numDetections) {
-            val startIdx = i * elementsPerDetection
-
-            if (startIdx + elementsPerDetection > output.size) break
-
-            val centerX = output[startIdx]
-            val centerY = output[startIdx + 1]
-            val width = output[startIdx + 2]
-            val height = output[startIdx + 3]
-            val objectness = output[startIdx + 4]
-
-            Log.d(TAG, "Detection $i: centerX=$centerX, centerY=$centerY, width=$width, height=$height, objectness=$objectness")
-
-            if (objectness < confidenceThreshold) {
-                Log.d(TAG, "Skipping detection $i with low objectness: $objectness")
-                continue
-            }
-
-            // Find best class
-            var bestClassId = -1
-            var bestClassScore = 0f
-
-            for (j in classNames.indices) {
-                val classScore = output[startIdx + 5 + j]
-                if (classScore > bestClassScore) {
-                    bestClassScore = classScore
-                    bestClassId = j
-                }
-            }
-
-            val finalConfidence = objectness * bestClassScore
-
-            if (finalConfidence < confidenceThreshold || bestClassId == -1) {
-                Log.d(TAG, "Skipping detection $i with low final confidence: $finalConfidence")
-                continue
-            }
-
-            // Convert normalized coordinates to pixel coordinates
-            val scaleX = originalWidth.toFloat()
-            val scaleY = originalHeight.toFloat()
-
-            val left = (centerX - width / 2) * scaleX
-            val top = (centerY - height / 2) * scaleY
-            val right = (centerX + width / 2) * scaleX
-            val bottom = (centerY + height / 2) * scaleY
-
-            val bbox = RectF(
-                max(0f, left),
-                max(0f, top),
-                min(originalWidth.toFloat(), right),
-                min(originalHeight.toFloat(), bottom)
-            )
-
-            if (bbox.width() < 10f || bbox.height() < 10f) {
-                Log.d(TAG, "Skipping detection $i with too small bbox: ${bbox.width()}x${bbox.height()}")
-                continue
-            }
-
-            detections.add(
-                Detection(
-                    bbox = bbox,
-                    confidence = finalConfidence,
-                    classId = bestClassId,
-                    className = classNames[bestClassId]
-                )
-            )
-        }
-
-        Log.d(TAG, "Found ${detections.size} valid detections from single array format")
-        return applyNMS(detections)
-    }
-
+    
     /**
      * Apply Non-Maximum Suppression - Mejorado para reducir detecciones múltiples
      */
@@ -527,51 +312,28 @@ class YoloDetector(private val context: Context) {
         // Ordenar por confianza descendente
         val sortedDetections = detections.sortedByDescending { it.confidence }
         val result = mutableListOf<Detection>()
+        val suppressed = BooleanArray(sortedDetections.size) { false }
 
-        // Aplicar NMS por clase para evitar detecciones múltiples del mismo tipo
-        for (classId in classNames.indices) {
-            val classDetections = sortedDetections.filter { it.classId == classId }
-            if (classDetections.isEmpty()) continue
+        for (i in sortedDetections.indices) {
+            if (suppressed[i]) continue
 
-            Log.d(TAG, "Processing ${classDetections.size} detections for class ${classNames[classId]}")
+            val currentDetection = sortedDetections[i]
+            result.add(currentDetection)
+            Log.d(TAG, "Keeping detection: ${currentDetection.className} with confidence ${currentDetection.confidence}")
 
-            val classResult = mutableListOf<Detection>()
+            for (j in (i + 1) until sortedDetections.size) {
+                if (suppressed[j]) continue
 
-            for (detection in classDetections) {
-                var shouldKeep = true
+                val otherDetection = sortedDetections[j]
 
-                // Verificar solapamiento con detecciones ya aceptadas de esta clase
-                for (kept in classResult) {
-                    val iou = calculateIoU(detection.bbox, kept.bbox)
+                // Aplicar NMS solo si son de la misma clase
+                if (currentDetection.classId == otherDetection.classId) {
+                    val iou = calculateIoU(currentDetection.bbox, otherDetection.bbox)
                     if (iou > iouThreshold) {
-                        Log.d(TAG, "Suppressing detection with IoU $iou > $iouThreshold")
-                        shouldKeep = false
-                        break
+                        Log.d(TAG, "Suppressing detection with IoU $iou > $iouThreshold for same class")
+                        suppressed[j] = true
                     }
                 }
-
-                // También verificar solapamiento con otras clases (más permisivo)
-                for (kept in result) {
-                    val iou = calculateIoU(detection.bbox, kept.bbox)
-                    if (iou > 0.5f) { // Umbral más alto para diferentes clases
-                        Log.d(TAG, "Suppressing detection due to overlap with different class, IoU: $iou")
-                        shouldKeep = false
-                        break
-                    }
-                }
-
-                if (shouldKeep) {
-                    classResult.add(detection)
-                    Log.d(TAG, "Keeping detection: ${detection.className} with confidence ${detection.confidence}")
-                }
-            }
-
-            // Solo mantener la mejor detección por clase si hay múltiples
-            if (classResult.size > 1) {
-                Log.d(TAG, "Multiple detections for ${classNames[classId]}, keeping only the best one")
-                result.add(classResult.first()) // Ya está ordenado por confianza
-            } else {
-                result.addAll(classResult)
             }
         }
 

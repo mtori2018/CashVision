@@ -3,6 +3,7 @@ package com.example.cashvision
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.util.Log
 import android.util.Size
 import android.widget.Button
 import android.widget.TextView
@@ -156,7 +157,8 @@ class MainActivity : AppCompatActivity() {
         val detector = yoloDetector ?: return
 
         imageAnalyzer = ImageAnalysis.Builder()
-            .setTargetResolution(Size(1280, 720))  // Mejor resolución para detección
+            .setTargetAspectRatio(AspectRatio.RATIO_16_9) // Usar relación de aspecto 16:9
+            .setTargetRotation(previewView.display.rotation) // Mantener la rotación de la pantalla
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .build()
@@ -208,29 +210,21 @@ class MainActivity : AppCompatActivity() {
                 Log.d("MainActivity", "Detection $index: ${detection.className} confidence=${detection.confidence} bbox=${detection.bbox}")
             }
 
-            // Filtrar detecciones con confianza razonable
-            val validDetections = scaledDetections.filter { it.confidence >= 0.4f }
+            // Filtrar detecciones con confianza consistente con el detector (0.3f)
+            val validDetections = scaledDetections.filter { it.confidence >= 0.3f }
 
-            Log.d("MainActivity", "Valid detections (>=40%): ${validDetections.size}")
+            Log.d("MainActivity", "Valid detections (>=30%): ${validDetections.size}")
 
-            // Si hay detecciones válidas, mostrar solo la mejor
-            val detectionsToShow = if (validDetections.isNotEmpty()) {
-                listOf(validDetections.maxByOrNull { it.confidence }!!)
-            } else if (scaledDetections.isNotEmpty()) {
-                // Mostrar la mejor detección aunque tenga baja confianza para debugging
-                Log.d("MainActivity", "No high-confidence detections, showing best available")
-                listOf(scaledDetections.maxByOrNull { it.confidence }!!)
-            } else {
-                Log.d("MainActivity", "No detections to show")
-                emptyList()
-            }
+            // Mostrar todas las detecciones válidas
+            val detectionsToShow = validDetections
 
             detectionOverlay.updateDetections(detectionsToShow)
 
             if (detectionsToShow.isNotEmpty()) {
-                val bestDetection = detectionsToShow.first()
-                statusText.text = "Detectado: ${bestDetection.getFormattedDenomination()} (${(bestDetection.confidence * 100).toInt()}%)"
-                Log.d("MainActivity", "Showing detection: ${bestDetection.className} with ${(bestDetection.confidence * 100).toInt()}%")
+                // Mostrar información de la primera detección o un resumen
+                val firstDetection = detectionsToShow.first()
+                statusText.text = "Detectado: ${firstDetection.getFormattedDenomination()} (${(firstDetection.confidence * 100).toInt()}%)"
+                Log.d("MainActivity", "Showing ${detectionsToShow.size} detections. First: ${firstDetection.className} with ${(firstDetection.confidence * 100).toInt()}%")
             } else {
                 statusText.text = getString(R.string.status_detecting)
             }
